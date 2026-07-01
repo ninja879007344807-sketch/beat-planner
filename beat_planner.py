@@ -54,7 +54,13 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
             counts.setdefault(i, 0)
  
         over  = [b for b, c in counts.items() if c > target + tolerance]
-        under = [b for b, c in counts.items() if c < target - tolerance]
+        # "Under" now means *any* group with room before the upper bound,
+        # not just groups below the lower bound. Otherwise, once most
+        # groups sit inside the tolerance band (neither over nor under),
+        # a genuinely over-populated group has nowhere left to offload
+        # its surplus to, and stays bloated (this was the root cause of
+        # the disproportionately large cluster / near-empty beat).
+        under = [b for b, c in counts.items() if c < target + tolerance]
         if not over or not under:
             break
  
@@ -71,13 +77,13 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
  
                 if counts[ob] <= target + tolerance:
                     break
-                if counts[ub] >= target - tolerance:
+                if counts[ub] >= target + tolerance:
                     continue
  
                 centroid_ub = coords[df[label_col] == ub].mean(axis=0)
                 centroid_ob = coords[df[label_col] == ob].mean(axis=0)
  
-                need   = (target - tolerance) - counts[ub]
+                need   = (target + tolerance) - counts[ub]
                 excess = counts[ob] - (target + tolerance)
                 max_move = min(excess, need)
                 moved_here = 0
