@@ -53,13 +53,23 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
         for i in range(1, n + 1):
             counts.setdefault(i, 0)
  
-        over  = [b for b, c in counts.items() if c > target + tolerance]
-        # "Under" now means *any* group with room before the upper bound,
-        # not just groups below the lower bound. Otherwise, once most
-        # groups sit inside the tolerance band (neither over nor under),
-        # a genuinely over-populated group has nowhere left to offload
-        # its surplus to, and stays bloated (this was the root cause of
-        # the disproportionately large cluster / near-empty beat).
+        # Stop as soon as every group is within the tolerance band — this
+        # is the real termination condition. The over/under lists below
+        # are just candidate pools for movement, not the stopping rule.
+        if all(target - tolerance <= c <= target + tolerance for c in counts.values()):
+            break
+ 
+        # Donors: any group *above* target (not just above the cap) can
+        # give up its surplus down to target. Restricting donors to only
+        # those above the cap starves severely under-filled groups —
+        # e.g. six mildly-above-target groups holding a couple of extra
+        # points each can't rescue one group that's 12 short, because
+        # there's no single group "over" enough to supply that much.
+        over  = [b for b, c in counts.items() if c > target]
+        # Recipients: any group with room before the upper bound, not
+        # just groups below the lower bound — same reasoning as above,
+        # applied to the receiving side (fixed previously for clusters
+        # that had nowhere to offload their surplus).
         under = [b for b, c in counts.items() if c < target + tolerance]
         if not over or not under:
             break
@@ -75,7 +85,7 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
                 for i in range(1, n + 1):
                     counts.setdefault(i, 0)
  
-                if counts[ob] <= target + tolerance:
+                if counts[ob] <= target:
                     break
                 if counts[ub] >= target + tolerance:
                     continue
@@ -84,7 +94,7 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
                 centroid_ob = coords[df[label_col] == ob].mean(axis=0)
  
                 need   = (target + tolerance) - counts[ub]
-                excess = counts[ob] - (target + tolerance)
+                excess = counts[ob] - target
                 max_move = min(excess, need)
                 moved_here = 0
  
@@ -190,7 +200,7 @@ def run_clustering(df, n_clusters, beats_per_cluster):
             sub['Beat_No'] = km2.fit_predict(sub_coords) + 1
  
         sub = strict_balance(sub, sub_coords, 'Beat_No',
-                             beats_per_cluster, t_beat, tolerance=4)
+                             beats_per_cluster, t_beat, tolerance=6)
         df.loc[sub_idx, 'Beat_No'] = sub['Beat_No']
  
     df['Final_Beat'] = ('Cluster ' + df['Cluster_No'].astype(str) +
