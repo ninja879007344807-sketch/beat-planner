@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 from sklearn.cluster import KMeans
 from scipy.spatial.distance import cdist
+from scipy.spatial import cKDTree
+from collections import deque
 import folium
 from io import BytesIO
  
@@ -33,27 +35,117 @@ def to_meters(lat, lon):
     y = np.radians(lat) * R
     return np.column_stack([x, y])
  
+def build_adjacency(df, coords, label_col, k=6):
+    """
+    Determine which groups are genuine geographic neighbors (share a
+    border) rather than just "closer on average". Two groups are
+    neighbors if any point in one has one of its k nearest overall
+    neighbors belonging to the other group.
+    """
+    n_pts = len(coords)
+    if n_pts < 2:
+        return {}
+    tree = cKDTree(coords)
+    labels = df[label_col].values
+    k_eff = min(k + 1, n_pts)  # +1 because the point itself is included
+    _, idx = tree.query(coords, k=k_eff)
+    adjacency = {lab: set() for lab in np.unique(labels)}
+    if k_eff == 1:
+        return adjacency
+    for i in range(n_pts):
+        li = labels[i]
+        neighbor_idx = np.atleast_1d(idx[i])
+        for j in neighbor_idx:
+            if j == i:
+                continue
+            lj = labels[j]
+            if lj != li:
+                adjacency[li].add(lj)
+                adjacency[lj].add(li)
+    return adjacency
+ 
+def shortest_path(adjacency, start, goal):
+    """BFS shortest route between two groups through the adjacency graph."""
+    if start == goal:
+        return [start]
+    visited = {start}
+    queue = deque([[start]])
+    while queue:
+        path = queue.popleft()
+        node = path[-1]
+        for nxt in adjacency.get(node, ()):
+            if nxt == goal:
+                return path + [nxt]
+            if nxt not in visited:
+                visited.add(nxt)
+                queue.append(path + [nxt])
+    return None
+ 
+def transfer_points(df, coords, label_col, from_label, to_label, amount, margins):
+    """
+    Move up to `amount` points from from_label to to_label, one hop
+    along the border between the two groups. Only points that are
+    genuinely closer to the destination than to their current group are
+    eligible, relaxing that requirement step by step (via `margins`) if
+    the strict pass doesn't find enough candidates. Returns the number
+    actually moved, which can be less than `amount` if the border
+    doesn't have enough nearby points to give up.
+    """
+    moved = 0
+    for margin in margins:
+        if moved >= amount:
+            break
+ 
+        mask_from = (df[label_col] == from_label).values
+        idx_from  = df[df[label_col] == from_label].index
+        mask_to   = (df[label_col] == to_label).values
+ 
+        if len(idx_from) == 0 or not mask_to.any():
+            break
+ 
+        pts           = coords[mask_from]
+        centroid_to   = coords[mask_to].mean(axis=0)
+        centroid_from = coords[mask_from].mean(axis=0)
+ 
+        dist_to   = cdist(pts, centroid_to.reshape(1, -1)).flatten()
+        dist_from = cdist(pts, centroid_from.reshape(1, -1)).flatten()
+ 
+        candidate_mask = dist_to < dist_from * margin
+        candidate_idx  = idx_from[candidate_mask]
+        candidate_dist = dist_to[candidate_mask]
+ 
+        if len(candidate_idx) == 0:
+            continue
+ 
+        remaining = amount - moved
+        take = min(remaining, len(candidate_idx))
+        move_idx = candidate_idx[np.argsort(candidate_dist)[:take]]
+        df.loc[move_idx, label_col] = to_label
+        moved += take
+ 
+    return moved
+ 
 def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
                     margins=(1.0, 1.15, 1.3, 1.5, 1.75, 2.0)):
     """
-    Rebalances group sizes toward `target` (+/- tolerance) by moving
-    points from over-populated to under-populated groups.
+    Rebalances group sizes toward `target` (+/- tolerance).
  
-    Compactness is balanced against equal sizing using progressive
-    relaxation: points are only moved if they are within `margin` times
-    as close to the destination centroid as to their current centroid.
-    We start strict (margin=1.0, i.e. genuinely closer to destination)
-    and only relax the margin step by step if that isn't enough to reach
-    the target range. This avoids both extremes: it won't leave huge
-    imbalances sitting unresolved, and it won't drag in a single wildly
-    distant point just to hit a headcount.
+    Points only ever move to a *geographic neighbor* -- a group they
+    genuinely share a border with. If the group that needs to shrink and
+    the group that needs to grow aren't neighbors, the surplus is routed
+    hop by hop through whichever shared neighbors connect them (the same
+    way you'd hand something across a crowded room person to person
+    rather than throwing it over everyone's heads). This keeps every
+    group a single contiguous patch on the map instead of letting
+    far-flung points jump across to a distant group just because they
+    happened to be numerically closer to its centroid.
     """
     for _ in range(max_iter):
         counts = df[label_col].value_counts().to_dict()
         for i in range(1, n + 1):
             counts.setdefault(i, 0)
  
-        # Stop as soon as every group is within the tolerance band — this
+        # Stop as soon as every group is within the tolerance band -- this
         # is the real termination condition. The over/under lists below
         # are just candidate pools for movement, not the stopping rule.
         if all(target - tolerance <= c <= target + tolerance for c in counts.values()):
@@ -61,13 +153,13 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
  
         # Donors: any group *above* target (not just above the cap) can
         # give up its surplus down to target. Restricting donors to only
-        # those above the cap starves severely under-filled groups —
+        # those above the cap starves severely under-filled groups --
         # e.g. six mildly-above-target groups holding a couple of extra
         # points each can't rescue one group that's 12 short, because
         # there's no single group "over" enough to supply that much.
         over  = [b for b, c in counts.items() if c > target]
         # Recipients: any group with room before the upper bound, not
-        # just groups below the lower bound — same reasoning as above,
+        # just groups below the lower bound -- same reasoning as above,
         # applied to the receiving side (fixed previously for clusters
         # that had nowhere to offload their surplus).
         under = [b for b, c in counts.items() if c < target + tolerance]
@@ -76,6 +168,10 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
  
         over_sorted  = sorted(over,  key=lambda b: -counts[b])
         under_sorted = sorted(under, key=lambda b: counts[b])
+ 
+        # Border graph -- recomputed each outer pass since group
+        # membership shifts as points move.
+        adjacency = build_adjacency(df, coords, label_col)
  
         moved_any = False
  
@@ -90,40 +186,32 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
                 if counts[ub] >= target + tolerance:
                     continue
  
-                centroid_ub = coords[df[label_col] == ub].mean(axis=0)
-                centroid_ob = coords[df[label_col] == ob].mean(axis=0)
- 
                 need   = (target + tolerance) - counts[ub]
                 excess = counts[ob] - target
                 max_move = min(excess, need)
-                moved_here = 0
+                if max_move <= 0:
+                    continue
  
-                for margin in margins:
-                    if moved_here >= max_move:
+                path = shortest_path(adjacency, ob, ub)
+                if not path or len(path) < 2:
+                    # No border connection currently exists between
+                    # these two groups (directly or via neighbors) --
+                    # skip rather than force a long-distance jump.
+                    continue
+ 
+                # Route the surplus hop by hop across shared borders.
+                # Each hop's donor group gives up its own border points
+                # to the next group in the chain, and only what actually
+                # makes it out of the final hop counts as delivered to
+                # the recipient -- the chain is only as strong as its
+                # weakest border.
+                amount = max_move
+                for a, b in zip(path[:-1], path[1:]):
+                    amount = transfer_points(df, coords, label_col, a, b, amount, margins)
+                    if amount <= 0:
                         break
  
-                    pts_mask   = (df[label_col] == ob).values
-                    pts_idx    = df[df[label_col] == ob].index
-                    pts_coords = coords[pts_mask]
- 
-                    if len(pts_idx) == 0:
-                        break
- 
-                    dist_to_ub = cdist(pts_coords, centroid_ub.reshape(1, -1)).flatten()
-                    dist_to_ob = cdist(pts_coords, centroid_ob.reshape(1, -1)).flatten()
- 
-                    candidate_mask = dist_to_ub < dist_to_ob * margin
-                    candidate_idx  = pts_idx[candidate_mask]
-                    candidate_dist = dist_to_ub[candidate_mask]
- 
-                    if len(candidate_idx) == 0:
-                        continue
- 
-                    remaining = max_move - moved_here
-                    take = min(remaining, len(candidate_idx))
-                    move_idx = candidate_idx[np.argsort(candidate_dist)[:take]]
-                    df.loc[move_idx, label_col] = ub
-                    moved_here += take
+                if amount > 0:
                     moved_any = True
  
         if not moved_any:
