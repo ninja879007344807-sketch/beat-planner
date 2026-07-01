@@ -33,16 +33,20 @@ def to_meters(lat, lon):
     y = np.radians(lat) * R
     return np.column_stack([x, y])
  
-def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300):
+def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300,
+                    margins=(1.0, 1.15, 1.3, 1.5, 1.75, 2.0)):
     """
-    Rebalances cluster sizes toward `target` (+/- tolerance) by moving
+    Rebalances group sizes toward `target` (+/- tolerance) by moving
     points from over-populated to under-populated groups.
  
-    Compactness is prioritized over strict balance: a point is only ever
-    moved if it is genuinely closer to the destination group's centroid
-    than to its current group's centroid (a true "border" point). If no
-    such points exist for a given over/under pair, that pair is left
-    alone rather than forcing a distant, disconnected point to move.
+    Compactness is balanced against equal sizing using progressive
+    relaxation: points are only moved if they are within `margin` times
+    as close to the destination centroid as to their current centroid.
+    We start strict (margin=1.0, i.e. genuinely closer to destination)
+    and only relax the margin step by step if that isn't enough to reach
+    the target range. This avoids both extremes: it won't leave huge
+    imbalances sitting unresolved, and it won't drag in a single wildly
+    distant point just to hit a headcount.
     """
     for _ in range(max_iter):
         counts = df[label_col].value_counts().to_dict()
@@ -73,29 +77,41 @@ def strict_balance(df, coords, label_col, n, target, tolerance=15, max_iter=300)
                 centroid_ub = coords[df[label_col] == ub].mean(axis=0)
                 centroid_ob = coords[df[label_col] == ob].mean(axis=0)
  
-                pts_mask   = (df[label_col] == ob).values
-                pts_idx    = df[df[label_col] == ob].index
-                pts_coords = coords[pts_mask]
- 
-                dist_to_ub = cdist(pts_coords, centroid_ub.reshape(1, -1)).flatten()
-                dist_to_ob = cdist(pts_coords, centroid_ob.reshape(1, -1)).flatten()
- 
-                # Only genuine border points qualify — no forced fallback.
-                border_mask = dist_to_ub < dist_to_ob
-                border_idx  = pts_idx[border_mask]
-                border_dist = dist_to_ub[border_mask]
- 
                 need   = (target - tolerance) - counts[ub]
                 excess = counts[ob] - (target + tolerance)
-                n_move = min(excess, need, len(border_idx))
+                max_move = min(excess, need)
+                moved_here = 0
  
-                if n_move > 0:
-                    move_idx = border_idx[np.argsort(border_dist)[:n_move]]
+                for margin in margins:
+                    if moved_here >= max_move:
+                        break
+ 
+                    pts_mask   = (df[label_col] == ob).values
+                    pts_idx    = df[df[label_col] == ob].index
+                    pts_coords = coords[pts_mask]
+ 
+                    if len(pts_idx) == 0:
+                        break
+ 
+                    dist_to_ub = cdist(pts_coords, centroid_ub.reshape(1, -1)).flatten()
+                    dist_to_ob = cdist(pts_coords, centroid_ob.reshape(1, -1)).flatten()
+ 
+                    candidate_mask = dist_to_ub < dist_to_ob * margin
+                    candidate_idx  = pts_idx[candidate_mask]
+                    candidate_dist = dist_to_ub[candidate_mask]
+ 
+                    if len(candidate_idx) == 0:
+                        continue
+ 
+                    remaining = max_move - moved_here
+                    take = min(remaining, len(candidate_idx))
+                    move_idx = candidate_idx[np.argsort(candidate_dist)[:take]]
                     df.loc[move_idx, label_col] = ub
+                    moved_here += take
                     moved_any = True
  
         if not moved_any:
-            # No further moves possible without breaking compactness.
+            # No further moves possible even with the most relaxed margin.
             break
     return df
  
